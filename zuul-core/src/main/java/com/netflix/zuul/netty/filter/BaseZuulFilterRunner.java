@@ -36,14 +36,11 @@ import com.netflix.zuul.netty.server.MethodBinding;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http.HttpContent;
 import io.perfmark.Link;
-import io.perfmark.PerfMark;
+import io.perfmark.TaskCloseable;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.atomic.AtomicReferenceArray;
-import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import rx.Observer;
-import rx.functions.Action;
 import rx.functions.Action0;
 import rx.functions.Action1;
 import rx.schedulers.Schedulers;
@@ -60,6 +57,10 @@ import static com.netflix.zuul.ExecutionStatus.SUCCESS;
 import static com.netflix.zuul.context.CommonContextKeys.NETTY_SERVER_CHANNEL_HANDLER_CONTEXT;
 import static com.netflix.zuul.filters.FilterType.ENDPOINT;
 import static com.netflix.zuul.filters.FilterType.INBOUND;
+import static io.perfmark.PerfMark.attachTag;
+import static io.perfmark.PerfMark.linkIn;
+import static io.perfmark.PerfMark.linkOut;
+import static io.perfmark.PerfMark.traceTask;
 
 /**
  * Subclasses of this class are supposed to be thread safe and hence should not have any non final member variables
@@ -73,7 +74,7 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
 
     private final String RUNNING_FILTER_IDX_SESSION_CTX_KEY;
     private final String AWAITING_BODY_FLAG_SESSION_CTX_KEY;
-    private static final Logger LOG = LoggerFactory.getLogger(BaseZuulFilterRunner.class);
+    private static final Logger logger = LoggerFactory.getLogger(BaseZuulFilterRunner.class);
 
     private static final CachedDynamicIntProperty FILTER_EXCESSIVE_EXEC_TIME = new CachedDynamicIntProperty("zuul.filters.excessive.execTime", 500);
 
@@ -120,42 +121,34 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
 
     protected final void invokeNextStage(final O zuulMesg, final HttpContent chunk) {
         if (nextStage != null) {
-            PerfMark.startTask(getClass().getName(), "invokeNextStageChunk");
-            try {
+            try (TaskCloseable ignored =
+                    traceTask(this, s -> s.getClass().getSimpleName() + ".invokeNextStageChunk")){
                 addPerfMarkTags(zuulMesg);
                 nextStage.filter(zuulMesg, chunk);
-            } finally {
-                PerfMark.stopTask(getClass().getName(), "invokeNextStageChunk");
             }
         } else {
             //Next stage is Netty channel handler
-            PerfMark.startTask(getClass().getName(), "fireChannelReadChunk");
-            try {
+            try (TaskCloseable ignored =
+                    traceTask(this, s -> s.getClass().getSimpleName() + ".fireChannelReadChunk")) {
                 addPerfMarkTags(zuulMesg);
                 getChannelHandlerContext(zuulMesg).fireChannelRead(chunk);
-            } finally {
-                PerfMark.stopTask(getClass().getName(), "fireChannelReadChunk");
             }
         }
     }
 
     protected final void invokeNextStage(final O zuulMesg) {
         if (nextStage != null) {
-            PerfMark.startTask(getClass().getName(), "invokeNextStage");
-            try {
+            try (TaskCloseable ignored =
+                    traceTask(this, s -> s.getClass().getSimpleName() + ".invokeNextStage")) {
                 addPerfMarkTags(zuulMesg);
                 nextStage.filter(zuulMesg);
-            } finally {
-                PerfMark.stopTask(getClass().getName(), "invokeNextStage");
             }
         } else {
             //Next stage is Netty channel handler
-            PerfMark.startTask(getClass().getName(), "fireChannelRead");
-            try {
+            try (TaskCloseable ignored =
+                    traceTask(this, s -> s.getClass().getSimpleName() + ".fireChannelRead")) {
                 addPerfMarkTags(zuulMesg);
                 getChannelHandlerContext(zuulMesg).fireChannelRead(zuulMesg);
-            } finally {
-                PerfMark.stopTask(getClass().getName(), "fireChannelRead");
             }
         }
     }
@@ -166,14 +159,15 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
             req = (HttpRequestInfo) inMesg;
         }
         if (inMesg instanceof HttpResponseMessage) {
-            req = ((HttpResponseMessage) inMesg).getOutboundRequest();
-            PerfMark.attachTag("statuscode", ((HttpResponseMessage) inMesg).getStatus());
+            HttpResponseMessage msg = (HttpResponseMessage) inMesg;
+            req = msg.getOutboundRequest();
+            attachTag("statuscode", msg.getStatus());
         }
         if (req != null) {
-            PerfMark.attachTag("path", req.getPath());
-            PerfMark.attachTag("originalhost", req.getOriginalHost());
+            attachTag("path", req, HttpRequestInfo::getPath);
+            attachTag("originalhost", req, HttpRequestInfo::getOriginalHost);
         }
-        PerfMark.attachTag("uuid", inMesg.getContext().getUUID());
+        attachTag("uuid", inMesg, m -> m.getContext().getUUID());
     }
 
     protected final O filter(final ZuulFilter<I, O> filter, final I inMesg) {
@@ -181,8 +175,7 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
         final ZuulMessage snapshot = inMesg.getContext().debugRouting() ? inMesg.clone() : null;
         FilterChainResumer resumer = null;
 
-        PerfMark.startTask(filter.filterName(), "filter");
-        try {
+        try (TaskCloseable ignored = traceTask(filter, f -> f.filterName() + ".filter")) {
             addPerfMarkTags(inMesg);
             ExecutionStatus filterRunStatus = null;
             if (filter.filterType() == INBOUND && inMesg.getContext().shouldSendErrorResponse()) {
@@ -190,13 +183,11 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
                 filterRunStatus = SKIPPED;
             }
 
-            PerfMark.startTask(filter.filterName(), "shouldSkipFilter");
-            try {
+            ;
+            try (TaskCloseable ignored2 = traceTask(filter, f -> f.filterName() + ".shouldSkipFilter")){
                 if (shouldSkipFilter(inMesg, filter)) {
                     filterRunStatus = SKIPPED;
                 }
-            } finally {
-              PerfMark.stopTask(filter.filterName(), "shouldSkipFilter");
             }
 
             if (filter.isDisabled()) {
@@ -210,7 +201,7 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
 
             if (!isMessageBodyReadyForFilter(filter, inMesg)) {
                 setFilterAwaitingBody(inMesg, true);
-                LOG.debug("Filter {} waiting for body, UUID {}", filter.filterName(), inMesg.getContext().getUUID());
+                logger.debug("Filter {} waiting for body, UUID {}", filter.filterName(), inMesg.getContext().getUUID());
                 return null;  //wait for whole body to be buffered
             }
             setFilterAwaitingBody(inMesg, false);
@@ -225,30 +216,24 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
             if (filter.getSyncType() == FilterSyncType.SYNC) {
                 final SyncZuulFilter<I, O> syncFilter = (SyncZuulFilter) filter;
                 final O outMesg;
-                PerfMark.startTask(filter.filterName(), "apply");
-                try {
+                try (TaskCloseable ignored2 = traceTask(filter, f -> f.filterName() + ".apply")) {
                     addPerfMarkTags(inMesg);
                     outMesg = syncFilter.apply(inMesg);
-                } finally {
-                  PerfMark.stopTask(filter.filterName(), "apply");
                 }
                 recordFilterCompletion(SUCCESS, filter, startTime, inMesg, snapshot);
                 return (outMesg != null) ? outMesg : filter.getDefaultOutput(inMesg);
             }
 
             // async filter
-            PerfMark.startTask(filter.filterName(), "applyAsync");
-            try {
-                final Link nettyToSchedulerLink = PerfMark.linkOut();
+            try (TaskCloseable ignored2 = traceTask(filter, f -> f.filterName() + ".applyAsync")){
+                final Link nettyToSchedulerLink = linkOut();
                 filter.incrementConcurrency();
                 resumer = new FilterChainResumer(inMesg, filter, snapshot, startTime);
                 filter.applyAsync(inMesg)
                         .doOnSubscribe(() -> {
-                            PerfMark.startTask(filter.filterName(), "onSubscribeAsync");
-                            try {
-                                PerfMark.linkIn(nettyToSchedulerLink);
-                            } finally {
-                              PerfMark.stopTask(filter.filterName(), "onSubscribeAsync");
+                            try (TaskCloseable ignored3 =
+                                    traceTask(filter, f -> f.filterName() + ".onSubscribeAsync")) {
+                                linkIn(nettyToSchedulerLink);
                             }
                         })
                         .doOnNext(resumer.onNextStarted(nettyToSchedulerLink))
@@ -257,8 +242,6 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
                         .observeOn(Schedulers.from(getChannelHandlerContext(inMesg).executor()))
                         .doOnUnsubscribe(resumer::decrementConcurrency)
                         .subscribe(resumer);
-            } finally {
-              PerfMark.stopTask(filter.filterName(), "applyAsync");
             }
 
             return null;  //wait for the async filter to finish
@@ -271,8 +254,6 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
             outMesg.finishBufferedBodyIfIncomplete();
             recordFilterCompletion(FAILED, filter, startTime, inMesg, snapshot);
             return outMesg;
-        } finally {
-          PerfMark.stopTask(filter.filterName(), "filter");
         }
     }
 
@@ -315,10 +296,10 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
         final String errorMsg = "Filter Exception: filter=" + filter.filterName() +
                 ", request-info=" + inMesg.getInfoForLogging() + ", msg=" + String.valueOf(t.getMessage());
         if (t instanceof ZuulException && !((ZuulException) t).shouldLogAsError()) {
-            LOG.warn(errorMsg);
+            logger.warn(errorMsg);
         }
         else {
-            LOG.error(errorMsg, t);
+            logger.error(errorMsg, t);
         }
 
         // Store this filter error for possible future use. But we still continue with next filter in the chain.
@@ -337,16 +318,20 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
         final long execTimeNs = System.nanoTime() - startTime;
         final long execTimeMs = execTimeNs / 1_000_000L;
         if (execTimeMs >= FILTER_EXCESSIVE_EXEC_TIME.get()) {
-            LOG.warn("Filter {} took {} ms to complete! status = {}", filter.filterName(), execTimeMs, status.name());
+            logger.warn("Filter {} took {} ms to complete! status = {}", filter.filterName(), execTimeMs, status.name());
         }
 
         // Record the execution summary in context.
         switch (status) {
             case FAILED:
-                zuulCtx.addFilterExecutionSummary(filter.filterName(), FAILED.name(), execTimeMs);
+                if (logger.isDebugEnabled()) {
+                    zuulCtx.addFilterExecutionSummary(filter.filterName(), FAILED.name(), execTimeMs);
+                }
                 break;
             case SUCCESS:
-                zuulCtx.addFilterExecutionSummary(filter.filterName(), SUCCESS.name(), execTimeMs);
+                if (logger.isDebugEnabled()) {
+                    zuulCtx.addFilterExecutionSummary(filter.filterName(), SUCCESS.name(), execTimeMs);
+                }
                 if (startSnapshot != null) {
                     //debugRouting == true
                     Debug.addRoutingDebug(zuulCtx, "Filter {" + filter.filterName() + " TYPE:" + filter.filterType().toString()
@@ -358,7 +343,7 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
                 break;
         }
 
-        LOG.debug("Filter {} completed with status {}, UUID {}", filter.filterName(), status.name(),
+        logger.debug("Filter {} completed with status {}, UUID {}", filter.filterName(), status.name(),
                 zuulMesg.getContext().getUUID());
         // Notify configured listener.
         usageNotifier.notify(filter, status);
@@ -376,7 +361,7 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
         final String path = (zuulReq != null) ? zuulReq.getPathAndQuery() : "-";
         final String method = (zuulReq != null) ? zuulReq.getMethod() : "-";
         final String errMesg = "Error with filter: " + filterName + ", path: " + path + ", method: " + method;
-        LOG.error(errMesg, ex);
+        logger.error(errMesg, ex);
         getChannelHandlerContext(zuulMesg).fireExceptionCaught(ex);
     }
 
@@ -423,34 +408,25 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
 
         @Override
         public void onNext(O outMesg) {
-            boolean stopped = false;
-            PerfMark.startTask(filter.filterName(), "onNextAsync");
-            try {
-                PerfMark.linkIn(onNextLinkOut.get());
+            try (TaskCloseable ignored = traceTask(filter, f -> f.filterName() + ".onNextAsync")) {
+                linkIn(onNextLinkOut.get());
                 addPerfMarkTags(inMesg);
                 recordFilterCompletion(SUCCESS, filter, startTime, inMesg, snapshot);
                 if (outMesg == null) {
                     outMesg = filter.getDefaultOutput(inMesg);
                 }
-                stopped = true;
-                PerfMark.stopTask(filter.filterName(), "onNextAsync");
                 resumeInBindingContext(outMesg, filter.filterName());
             }
             catch (Exception e) {
                 decrementConcurrency();
                 handleException(inMesg, filter.filterName(), e);
-            } finally {
-                if (!stopped) {
-                    PerfMark.stopTask(filter.filterName(), "onNextAsync");
-                }
             }
         }
 
         @Override
         public void onError(Throwable ex) {
-            PerfMark.startTask(filter.filterName(), "onErrorAsync");
-            try {
-                PerfMark.linkIn(onErrorLinkOut.get());
+            try (TaskCloseable ignored = traceTask(filter, f -> f.filterName() + ".onErrorAsync")) {
+                linkIn(onErrorLinkOut.get());
                 decrementConcurrency();
                 recordFilterCompletion(FAILED, filter, startTime, inMesg, snapshot);
                 final O outMesg = handleFilterException(inMesg, filter, ex);
@@ -458,51 +434,41 @@ public abstract class BaseZuulFilterRunner<I extends ZuulMessage, O extends Zuul
             }
             catch (Exception e) {
                 handleException(inMesg, filter.filterName(), e);
-            } finally {
-              PerfMark.stopTask(filter.filterName(), "onErrorAsync");            }
+            }
         }
 
         @Override
         public void onCompleted() {
-            PerfMark.startTask(filter.filterName(), "onCompletedAsync");
-            try {
-                PerfMark.linkIn(onCompletedLinkOut.get( ));
+            try (TaskCloseable ignored = traceTask(filter, f -> f.filterName() + ".onCompletedAsync")) {
+                linkIn(onCompletedLinkOut.get());
                 decrementConcurrency();
-            } finally {
-              PerfMark.stopTask(filter.filterName(), "onCompletedAsync");
             }
         }
 
         private Action1<O> onNextStarted(Link onNextLinkIn) {
             return o -> {
-                PerfMark.startTask(filter.filterName(), "onNext");
-                try {
-                    PerfMark.linkIn(onNextLinkIn);
-                    onNextLinkOut.compareAndSet(null, PerfMark.linkOut());
-                } finally {
-                    PerfMark.stopTask(filter.filterName(), "onNext");                }
+                try (TaskCloseable ignored = traceTask(filter, f -> f.filterName() + ".onNext")) {
+                    linkIn(onNextLinkIn);
+                    onNextLinkOut.compareAndSet(null, linkOut());
+                }
             };
         }
 
         private Action1<Throwable> onErrorStarted(Link onErrorLinkIn) {
             return t -> {
-                PerfMark.startTask(filter.filterName(), "onError");
-                try {
-                    PerfMark.linkIn(onErrorLinkIn);
-                    onErrorLinkOut.compareAndSet(null, PerfMark.linkOut());
-                } finally {
-                    PerfMark.stopTask(filter.filterName(), "onError");                }
+                try (TaskCloseable ignored = traceTask(filter, f -> f.filterName() + ".onError")) {
+                    linkIn(onErrorLinkIn);
+                    onErrorLinkOut.compareAndSet(null, linkOut());
+                }
             };
         }
 
         private Action0 onCompletedStarted(Link onCompletedLinkIn) {
             return () -> {
-                PerfMark.startTask(filter.filterName(), "onCompleted");
-                try {
-                    PerfMark.linkIn(onCompletedLinkIn);
-                    onCompletedLinkOut.compareAndSet(null, PerfMark.linkOut());
-                } finally {
-                    PerfMark.stopTask(filter.filterName(), "onCompleted");                }
+                try (TaskCloseable ignored = traceTask(filter, f -> f.filterName() + ".onCompleted")) {
+                    linkIn(onCompletedLinkIn);
+                    onCompletedLinkOut.compareAndSet(null, linkOut());
+                }
             };
         }
     }

@@ -15,36 +15,37 @@
  */
 package com.netflix.zuul.filters;
 
-
-import javax.inject.Singleton;
 import java.util.Collection;
-import java.util.concurrent.ConcurrentHashMap;
+import javax.annotation.Nullable;
 
-/**
- * @author mhawthorne
- */
-@Singleton
-public class FilterRegistry
-{
-    private final ConcurrentHashMap<String, ZuulFilter> filters = new ConcurrentHashMap<String, ZuulFilter>();
+public interface FilterRegistry {
+    @Nullable
+    ZuulFilter<?, ?> get(String key);
 
-    public ZuulFilter remove(String key) {
-        return this.filters.remove(key);
-    }
+    int size();
 
-    public ZuulFilter get(String key) {
-        return this.filters.get(key);
-    }
+    Collection<ZuulFilter<?, ?>> getAllFilters();
 
-    public void put(String key, ZuulFilter filter) {
-        this.filters.putIfAbsent(key, filter);
-    }
+    /**
+     * Indicates if this registry can be modified.  Implementations should not change the return;
+     * they return the same value each time.
+     */
+    boolean isMutable();
 
-    public int size() {
-        return this.filters.size();
-    }
+    /**
+     * Removes the filter from the registry, and returns it.   Returns {@code null} no such filter
+     * was found.  Callers should check {@link #isMutable()} before calling this method.
+     *
+     * @throws IllegalStateException if this registry is not mutable.
+     */
+    @Nullable
+    ZuulFilter<?, ?> remove(String key);
 
-    public Collection<ZuulFilter> getAllFilters() {
-        return this.filters.values();
-    }
+    /**
+     * Stores the filter into the registry.  If an existing filter was present with the same key,
+     * it is removed.  Callers should check {@link #isMutable()} before calling this method.
+     *
+     * @throws IllegalStateException if this registry is not mutable.
+     */
+    void put(String key, ZuulFilter<?, ?> filter);
 }

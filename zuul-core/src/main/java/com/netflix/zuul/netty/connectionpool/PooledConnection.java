@@ -16,16 +16,15 @@
 
 package com.netflix.zuul.netty.connectionpool;
 
-import com.netflix.appinfo.InstanceInfo;
-import com.netflix.loadbalancer.Server;
-import com.netflix.loadbalancer.ServerStats;
 import com.netflix.spectator.api.Counter;
+import com.netflix.zuul.discovery.DiscoveryResult;
 import com.netflix.zuul.passport.CurrentPassport;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelPipeline;
 import io.netty.handler.timeout.ReadTimeoutHandler;
 import io.netty.util.AttributeKey;
+import java.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,11 +38,9 @@ public class PooledConnection {
     protected static final AttributeKey<PooledConnection> CHANNEL_ATTR = AttributeKey.newInstance("_pooled_connection");
     public static final String READ_TIMEOUT_HANDLER_NAME = "readTimeoutHandler";
 
-    private final Server server;
+    private final DiscoveryResult server;
     private final Channel channel;
     private final ClientChannelManager channelManager;
-    private final InstanceInfo serverKey;
-    private final ServerStats serverStats;
     private final long creationTS;
     private final Counter closeConnCounter;
     private final Counter closeWrtBusyConnCounter;
@@ -72,17 +69,13 @@ public class PooledConnection {
     private boolean shouldClose = false;
     private boolean released = false;
 
-    public PooledConnection(final Channel channel, final Server server, final ClientChannelManager channelManager,
-                     final InstanceInfo serverKey,
-                     final ServerStats serverStats, 
+    public PooledConnection(final Channel channel, final DiscoveryResult server, final ClientChannelManager channelManager,
                      final Counter closeConnCounter, 
                      final Counter closeWrtBusyConnCounter)
     {
         this.channel = channel;
         this.server = server;
         this.channelManager = channelManager;
-        this.serverKey = serverKey;
-        this.serverStats = serverStats;
         this.creationTS = System.currentTimeMillis();
         this.closeConnCounter = closeConnCounter;
         this.closeWrtBusyConnCounter = closeWrtBusyConnCounter;
@@ -113,17 +106,13 @@ public class PooledConnection {
         return this.channelManager.getConfig();
     }
 
-    public Server getServer()
+    public DiscoveryResult getServer()
     {
         return server;
     }
 
     public Channel getChannel() {
         return channel;
-    }
-
-    public InstanceInfo getServerKey() {
-        return serverKey;
     }
 
     public long getUsageCount()
@@ -144,17 +133,13 @@ public class PooledConnection {
         return System.currentTimeMillis() - creationTS;
     }
 
-    public ServerStats getServerStats() {
-        return serverStats;
-    }
-
     public void startRequestTimer() {
         reqStartTime = System.nanoTime();
     }
 
     public long stopRequestTimer() {
         final long responseTime = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - reqStartTime);
-        serverStats.noteResponseTime(responseTime);
+        server.noteResponseTime(responseTime);
         return responseTime;
     }
 
@@ -183,16 +168,14 @@ public class PooledConnection {
     }
 
     public ChannelFuture close() {
-        final ServerStats stats = getServerStats();
-        stats.decrementOpenConnectionsCount();
+        server.decrementOpenConnectionsCount();
         closeConnCounter.increment();
         return channel.close();
     }
 
     public void updateServerStats() {
-        final ServerStats stats = getServerStats();
-        stats.decrementOpenConnectionsCount();
-        stats.close();
+        server.decrementOpenConnectionsCount();
+        server.stopPublishingStats();
     }
 
     public ChannelFuture closeAndRemoveFromPool()
@@ -241,9 +224,10 @@ public class PooledConnection {
         }
     }
 
-    public void startReadTimeoutHandler(int readTimeout)
+    public void startReadTimeoutHandler(Duration readTimeout)
     {
-        channel.pipeline().addBefore("originNettyLogger", READ_TIMEOUT_HANDLER_NAME, new ReadTimeoutHandler(readTimeout, TimeUnit.MILLISECONDS));
+        channel.pipeline().addBefore("originNettyLogger", READ_TIMEOUT_HANDLER_NAME,
+                new ReadTimeoutHandler(readTimeout.toMillis(), TimeUnit.MILLISECONDS));
     }
 
 
@@ -252,7 +236,6 @@ public class PooledConnection {
     {
         return "PooledConnection{" +
                 "channel=" + channel +
-                ", serverKey=" + serverKey +
                 ", usageCount=" + usageCount +
                 '}';
     }

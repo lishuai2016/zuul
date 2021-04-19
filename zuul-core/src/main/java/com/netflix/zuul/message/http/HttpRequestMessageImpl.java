@@ -30,15 +30,19 @@ import com.netflix.zuul.util.HttpUtils;
 import io.netty.handler.codec.http.Cookie;
 import io.netty.handler.codec.http.CookieDecoder;
 import io.netty.handler.codec.http.HttpContent;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLDecoder;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * User: michaels
@@ -67,7 +71,6 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
         }
     }
 
-    private static final Pattern PTN_COLON = Pattern.compile(":");
     private static final String URI_SCHEME_SEP = "://";
     private static final String URI_SCHEME_HTTP = "http";
     private static final String URI_SCHEME_HTTPS = "https";
@@ -83,6 +86,7 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
     private String scheme;
     private int port;
     private String serverName;
+    private SocketAddress clientRemoteAddress;
 
     private HttpRequestInfo inboundRequest = null;
     private Cookies parsedCookies = null;
@@ -92,17 +96,24 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
     private String pathAndQuery = null;
     private String infoForLogging = null;
 
+    private static final SocketAddress UNDEFINED_CLIENT_DEST_ADDRESS = new SocketAddress() {
+        @Override
+        public String toString() {
+            return "Undefined destination address.";
+        }
+    };
 
     public HttpRequestMessageImpl(SessionContext context, String protocol, String method, String path,
                                   HttpQueryParams queryParams, Headers headers, String clientIp, String scheme,
                                   int port, String serverName)
     {
-        this(context, protocol, method, path, queryParams, headers, clientIp, scheme, port, serverName, false);
+        this(context, protocol, method, path, queryParams, headers, clientIp, scheme, port, serverName,
+                UNDEFINED_CLIENT_DEST_ADDRESS, false);
     }
 
     public HttpRequestMessageImpl(SessionContext context, String protocol, String method, String path,
                                   HttpQueryParams queryParams, Headers headers, String clientIp, String scheme,
-                                  int port, String serverName,
+                                  int port, String serverName, SocketAddress clientRemoteAddress,
                                   boolean immutable)
     {
         this.immutable = immutable;
@@ -123,6 +134,7 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
         this.scheme = scheme;
         this.port = port;
         this.serverName = serverName;
+        this.clientRemoteAddress = clientRemoteAddress;
     }
 
     private void immutableCheck()
@@ -347,7 +359,7 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
     public Cookies reParseCookies()
     {
         Cookies cookies = new Cookies();
-        for (String aCookieHeader : getHeaders().get(HttpHeaderNames.COOKIE))
+        for (String aCookieHeader : getHeaders().getAll(HttpHeaderNames.COOKIE))
         {
             try {
                 if (CLEAN_COOKIES.get()) {
@@ -391,8 +403,8 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
     {
         HttpRequestMessageImpl clone = new HttpRequestMessageImpl(message.getContext().clone(),
                 protocol, method, path,
-                queryParams.clone(), message.getHeaders().clone(), clientIp, scheme,
-                port, serverName);
+                queryParams.clone(), Headers.copyOf(message.getHeaders()), clientIp, scheme,
+                port, serverName, clientRemoteAddress, immutable);
         if (getInboundRequest() != null) {
             clone.inboundRequest = (HttpRequestInfo) getInboundRequest().clone();
         }
@@ -401,11 +413,11 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
 
     protected HttpRequestInfo copyRequestInfo()
     {
-        // Unlike clone(), we create immutable copies of the Headers and HttpQueryParams here.
+
         HttpRequestMessageImpl req = new HttpRequestMessageImpl(message.getContext(),
                 protocol, method, path,
-                queryParams.immutableCopy(), message.getHeaders().immutableCopy(), clientIp, scheme,
-                port, serverName, true);
+                queryParams.immutableCopy(),  Headers.copyOf(message.getHeaders()), clientIp, scheme,
+                port, serverName, clientRemoteAddress, true);
         req.setHasBody(hasBody());
         return req;
     }
@@ -460,25 +472,31 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
      *
      * The Host header may contain port, but in this method we strip it out for consistency - use the
      * getOriginalPort method for that.
-     *
-     * @return
      */
     @Override
-    public String getOriginalHost()
-    {
-        String host = getHeaders().getFirst(HttpHeaderNames.X_FORWARDED_HOST);
-        if (host == null) {
-            host = getHeaders().getFirst(HttpHeaderNames.HOST);
-            if (host != null) {
-                // Host header may have a trailing port. Strip that out if it does.
-                host = PTN_COLON.split(host)[0];
-            }
-
-            if (host == null) {
-                host = getServerName();
-            }
+    public String getOriginalHost() {
+        try {
+            return getOriginalHost(getHeaders(), getServerName());
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException(e);
         }
-        return host;
+    }
+
+    @VisibleForTesting
+    static String getOriginalHost(Headers headers, String serverName) throws URISyntaxException {
+        String xForwardedHost = headers.getFirst(HttpHeaderNames.X_FORWARDED_HOST);
+        if (xForwardedHost != null) {
+            return xForwardedHost;
+        }
+        String host = headers.getFirst(HttpHeaderNames.HOST);
+        if (host != null) {
+            URI uri = new URI(/* scheme= */ null, host, /* path= */ null, /* query= */ null, /* fragment= */ null);
+            if (uri.getHost() == null) {
+                throw new URISyntaxException(host, "Bad host name");
+            }
+            return uri.getHost();
+        }
+        return serverName;
     }
 
     @Override
@@ -502,30 +520,42 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
     }
 
     @Override
-    public int getOriginalPort()
-    {
-        int port;
-        String portStr = getHeaders().getFirst(HttpHeaderNames.X_FORWARDED_PORT);
-        if (portStr == null) {
-            // Check if port was specified on a Host header.
-            String hostHeader = getHeaders().getFirst(HttpHeaderNames.HOST);
-            if (hostHeader != null) {
-                String[] hostParts = PTN_COLON.split(hostHeader);
-                if (hostParts.length == 2) {
-                    port = Integer.parseInt(hostParts[1]);
-                }
-                else {
-                    port = getPort();
-                }
-            }
-            else {
-                port = getPort();
+    public int getOriginalPort() {
+        try {
+            return getOriginalPort(getContext(), getHeaders(), getPort());
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException(e);
+        }
+    }
+
+    @VisibleForTesting
+    static int getOriginalPort(SessionContext context, Headers headers, int serverPort) throws URISyntaxException {
+        if (context.containsKey(CommonContextKeys.PROXY_PROTOCOL_DESTINATION_ADDRESS)) {
+            return ((InetSocketAddress) context.get(CommonContextKeys.PROXY_PROTOCOL_DESTINATION_ADDRESS)).getPort();
+        }
+        String portStr = headers.getFirst(HttpHeaderNames.X_FORWARDED_PORT);
+        if (portStr != null && !portStr.isEmpty()) {
+            return Integer.parseInt(portStr);
+        }
+        // Check if port was specified on a Host header.
+        String host = headers.getFirst(HttpHeaderNames.HOST);
+        if (host != null) {
+            URI uri = new URI(/* scheme= */ null, host, /* path= */ null, /* query= */ null, /* fragment= */ null);
+            if (uri.getPort() != -1) {
+                return uri.getPort();
             }
         }
-        else {
-            port = Integer.parseInt(portStr);
+        return serverPort;
+    }
+
+    @Override
+    public Optional<Integer> getClientDestinationPort() {
+        if (clientRemoteAddress instanceof InetSocketAddress) {
+            InetSocketAddress inetSocketAddress = (InetSocketAddress) this.clientRemoteAddress;
+            return Optional.of(inetSocketAddress.getPort());
+        } else {
+            return Optional.empty();
         }
-        return port;
     }
 
     /**
@@ -555,7 +585,7 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
 
             String scheme = getOriginalScheme().toLowerCase();
             uri.append(scheme);
-            uri.append(URI_SCHEME_SEP).append(getOriginalHost());
+            uri.append(URI_SCHEME_SEP).append(getOriginalHost(getHeaders(), getServerName()));
 
             int port = getOriginalPort();
             if ((URI_SCHEME_HTTP.equals(scheme) && 80 == port)
@@ -568,6 +598,11 @@ public class HttpRequestMessageImpl implements HttpRequestMessage
             uri.append(getPathAndQuery());
 
             return uri.toString();
+        }
+        catch (URISyntaxException e) {
+            // This is not really so bad, just debug log it and move on.
+            LOG.debug("Error reconstructing request URI!", e);
+            return "";
         }
         catch (Exception e) {
             LOG.error("Error reconstructing request URI!", e);

@@ -15,16 +15,21 @@
  */
 package com.netflix.zuul.message.http;
 
+import com.google.common.base.Strings;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.ListMultimap;
-import org.apache.commons.lang3.StringUtils;
-
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
-import java.util.*;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.StringTokenizer;
 
 /**
  * User: michaels
@@ -78,7 +83,7 @@ public class HttpQueryParams implements Cloneable
                 queryParams.add(name, value);
 
                 // respect trailing equals for key-only params
-                if (s.endsWith("=") && StringUtils.isBlank(value)) {
+                if (s.endsWith("=") && value.isEmpty()) {
                     queryParams.setTrailingEquals(name, true);
                 }
             }
@@ -103,9 +108,6 @@ public class HttpQueryParams implements Cloneable
     /**
      * Get the first value found for this key even if there are multiple. If none, then
      * return null.
-     *
-     * @param name
-     * @return
      */
     public String getFirst(String name)
     {
@@ -128,6 +130,14 @@ public class HttpQueryParams implements Cloneable
         return delegate.containsKey(name);
     }
 
+    /**
+     * Per https://tools.ietf.org/html/rfc7230#page-19, query params are to be treated as case sensitive.
+     * However, as an utility, this exists to allow us to do a case insensitive match on demand.
+     */
+    public boolean containsIgnoreCase(String name) {
+        return delegate.containsKey(name) || delegate.containsKey(name.toLowerCase(Locale.ROOT));
+    }
+
     public boolean contains(String name, String value)
     {
         return delegate.containsEntry(name, value);
@@ -135,9 +145,6 @@ public class HttpQueryParams implements Cloneable
 
     /**
      * Replace any/all entries with this key, with this single entry.
-     *
-     * @param name
-     * @param value
      */
     public void set(String name, String value)
     {
@@ -175,7 +182,7 @@ public class HttpQueryParams implements Cloneable
         try {
             for (Map.Entry<String, String> entry : entries()) {
                 sb.append(URLEncoder.encode(entry.getKey(), "UTF-8"));
-                if (StringUtils.isNotEmpty(entry.getValue())) {
+                if (!Strings.isNullOrEmpty(entry.getValue())) {
                     sb.append('=');
                     sb.append(URLEncoder.encode(entry.getValue(), "UTF-8"));
                 }
@@ -203,7 +210,7 @@ public class HttpQueryParams implements Cloneable
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, String> entry : entries()) {
             sb.append(entry.getKey());
-            if (StringUtils.isNotEmpty(entry.getValue())) {
+            if (!Strings.isNullOrEmpty(entry.getValue())) {
                 sb.append('=');
                 sb.append(entry.getValue());
             }

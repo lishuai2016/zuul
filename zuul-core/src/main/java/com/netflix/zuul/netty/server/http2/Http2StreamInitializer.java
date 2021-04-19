@@ -16,9 +16,12 @@
 
 package com.netflix.zuul.netty.server.http2;
 
+import static com.netflix.zuul.netty.server.http2.Http2OrHttpHandler.PROTOCOL_NAME;
 import com.netflix.netty.common.Http2ConnectionCloseHandler;
 import com.netflix.netty.common.Http2ConnectionExpiryHandler;
+import com.netflix.netty.common.SourceAddressChannelHandler;
 import com.netflix.netty.common.metrics.Http2MetricsChannelHandlers;
+import com.netflix.netty.common.proxyprotocol.HAProxyMessageChannelHandler;
 import com.netflix.zuul.netty.server.BaseZuulChannelInitializer;
 import com.netflix.zuul.netty.server.ssl.SslHandshakeInfoHandler;
 import io.netty.channel.Channel;
@@ -28,12 +31,7 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelPipeline;
 import io.netty.handler.codec.http2.Http2StreamFrameToHttpObjectCodec;
 import io.netty.util.AttributeKey;
-import com.netflix.netty.common.SourceAddressChannelHandler;
-import com.netflix.netty.common.proxyprotocol.ElbProxyProtocolChannelHandler;
-
 import java.util.function.Consumer;
-
-import static com.netflix.zuul.netty.server.http2.Http2OrHttpHandler.PROTOCOL_NAME;
 
 /**
  * TODO - can this be done when we create the Http2StreamChannelBootstrap instead now?
@@ -87,6 +85,7 @@ public class Http2StreamInitializer extends ChannelInboundHandlerAdapter
         pipeline.addLast("h2_downgrader", new Http2StreamFrameToHttpObjectCodec(true));
         pipeline.addLast(http2StreamErrorHandler);
         pipeline.addLast(http2StreamHeaderCleaner);
+        pipeline.addLast(new Http2ContentLengthEnforcingHandler());
     }
 
     protected void copyAttrsFromParentChannel(Channel parent, Channel child)
@@ -94,17 +93,16 @@ public class Http2StreamInitializer extends ChannelInboundHandlerAdapter
         AttributeKey[] attributesToCopy = {
                 SourceAddressChannelHandler.ATTR_LOCAL_ADDRESS,
                 SourceAddressChannelHandler.ATTR_LOCAL_INET_ADDR,
-                SourceAddressChannelHandler.ATTR_LOCAL_PORT,
                 SourceAddressChannelHandler.ATTR_SOURCE_ADDRESS,
                 SourceAddressChannelHandler.ATTR_SOURCE_INET_ADDR,
-                SourceAddressChannelHandler.ATTR_SOURCE_PORT,
                 SourceAddressChannelHandler.ATTR_SERVER_LOCAL_ADDRESS,
                 SourceAddressChannelHandler.ATTR_SERVER_LOCAL_PORT,
+                SourceAddressChannelHandler.ATTR_PROXY_PROTOCOL_DESTINATION_ADDRESS,
 
                 PROTOCOL_NAME,
                 SslHandshakeInfoHandler.ATTR_SSL_INFO,
-                ElbProxyProtocolChannelHandler.ATTR_HAPROXY_MESSAGE,
-                ElbProxyProtocolChannelHandler.ATTR_HAPROXY_VERSION,
+                HAProxyMessageChannelHandler.ATTR_HAPROXY_MESSAGE,
+                HAProxyMessageChannelHandler.ATTR_HAPROXY_VERSION,
 
                 BaseZuulChannelInitializer.ATTR_CHANNEL_CONFIG
         };

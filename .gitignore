@@ -61,5 +61,10 @@ atlassian-ide-plugin.xml
 .settings
 .metadata
 
+zuul-sample/src/main/generated/
+
 # NetBeans specific files/directories
 .nbattrs
+
+# publishing secrets
+secrets/signing-key

@@ -17,7 +17,7 @@
 package com.netflix.zuul.netty.connectionpool;
 
 import com.google.common.base.Stopwatch;
-import com.netflix.loadbalancer.Server;
+import com.netflix.zuul.discovery.DiscoveryResult;
 import com.netflix.zuul.exception.ErrorType;
 import com.netflix.zuul.exception.OutboundErrorType;
 
@@ -32,13 +32,13 @@ public class BasicRequestStat implements RequestStat {
     private volatile boolean isFinished;
     private volatile Stopwatch stopwatch;
 
-    public BasicRequestStat(String clientName) {
+    public BasicRequestStat() {
         this.isFinished = false;
         this.stopwatch = Stopwatch.createStarted();
     }
 
     @Override
-    public RequestStat server(Server server) {
+    public RequestStat server(DiscoveryResult server) {
         return this;
     }
 

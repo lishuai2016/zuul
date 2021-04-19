@@ -16,18 +16,22 @@
 
 package com.netflix.zuul.netty.connectionpool;
 
-import com.google.common.collect.Sets;
-import com.netflix.appinfo.InstanceInfo;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.net.InetAddresses;
 import com.netflix.client.config.IClientConfig;
-import com.netflix.loadbalancer.*;
-import com.netflix.niws.loadbalancer.DiscoveryEnabledServer;
 import com.netflix.spectator.api.Counter;
 import com.netflix.spectator.api.Registry;
 import com.netflix.spectator.api.histogram.PercentileTimer;
+import com.netflix.zuul.discovery.DiscoveryResult;
+import com.netflix.zuul.discovery.DynamicServerResolver;
+import com.netflix.zuul.discovery.ResolverResult;
 import com.netflix.zuul.exception.OutboundErrorType;
+import com.netflix.zuul.resolver.Resolver;
+import com.netflix.zuul.resolver.ResolverListener;
 import com.netflix.zuul.netty.SpectatorUtils;
 import com.netflix.zuul.netty.insights.PassportStateHttpClientHandler;
 import com.netflix.zuul.netty.server.OriginResponseReceiver;
+import com.netflix.zuul.origins.OriginName;
 import com.netflix.zuul.passport.CurrentPassport;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
@@ -36,18 +40,18 @@ import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoop;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.concurrent.Promise;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.util.HashSet;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.List;
-import java.util.Set;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-
-import static com.netflix.client.config.CommonClientConfigKey.NFLoadBalancerClassName;
+import javax.annotation.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * User: michaels@netflix.com
@@ -59,13 +63,12 @@ public class DefaultClientChannelManager implements ClientChannelManager {
 
     public static final String METRIC_PREFIX = "connectionpool";
 
-    private final DynamicServerListLoadBalancer loadBalancer;
+    private final Resolver <? extends DiscoveryResult> dynamicServerResolver;
     private final ConnectionPoolConfig connPoolConfig;
     private final IClientConfig clientConfig;
     private final Registry spectatorRegistry;
 
-    /* DeploymentContextBasedVIP for which to maintain this connection pool */
-    private final String vip;
+    private final OriginName originName;
 
     private static final Throwable SHUTTING_DOWN_ERR = new IllegalStateException("ConnectionPool is shutting down now.");
     private volatile boolean shuttingDown = false;
@@ -86,41 +89,73 @@ public class DefaultClientChannelManager implements ClientChannelManager {
     private final AtomicInteger connsInPool;
     private final AtomicInteger connsInUse;
 
-    private final ConcurrentHashMap<Server, IConnectionPool> perServerPools;
+    private final ConcurrentHashMap<DiscoveryResult, IConnectionPool> perServerPools;
 
     private NettyClientConnectionFactory clientConnFactory;
     private OriginChannelInitializer channelInitializer;
 
     public static final String IDLE_STATE_HANDLER_NAME = "idleStateHandler";
 
-    public DefaultClientChannelManager(String originName, String vip, IClientConfig clientConfig, Registry spectatorRegistry) {
-        this.loadBalancer = createLoadBalancer(clientConfig);
+    public DefaultClientChannelManager(
+            OriginName originName, IClientConfig clientConfig, Registry spectatorRegistry) {
+        this.originName = Objects.requireNonNull(originName, "originName");
+        this.dynamicServerResolver = new DynamicServerResolver(clientConfig, new ServerPoolListener());
 
-        this.vip = vip;
+        String metricId = originName.getMetricId();
+
         this.clientConfig = clientConfig;
         this.spectatorRegistry = spectatorRegistry;
         this.perServerPools = new ConcurrentHashMap<>(200);
 
-        // Setup a listener for Discovery serverlist changes.
-        this.loadBalancer.addServerListChangeListener((oldList, newList) -> removeMissingServerConnectionPools(oldList, newList));
+        this.connPoolConfig = new ConnectionPoolConfigImpl(originName, this.clientConfig);
+
+        this.createNewConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_create", metricId);
+        this.createConnSucceededCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_create_success", metricId);
+        this.createConnFailedCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_create_fail", metricId);
+
+        this.closeConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_close", metricId);
+        this.requestConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_request", metricId);
+        this.reuseConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_reuse", metricId);
+        this.releaseConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_release", metricId);
+        this.alreadyClosedCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_alreadyClosed", metricId);
+        this.connTakenFromPoolIsNotOpen = SpectatorUtils.newCounter(METRIC_PREFIX + "_fromPoolIsClosed", metricId);
+        this.maxConnsPerHostExceededCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_maxConnsPerHostExceeded", metricId);
+        this.closeWrtBusyConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_closeWrtBusyConnCounter", metricId);
+        this.connEstablishTimer = PercentileTimer.get(spectatorRegistry, spectatorRegistry.createId(METRIC_PREFIX + "_createTiming", "id", metricId));
+        this.connsInPool = SpectatorUtils.newGauge(METRIC_PREFIX + "_inPool", metricId, new AtomicInteger());
+        this.connsInUse = SpectatorUtils.newGauge(METRIC_PREFIX + "_inUse", metricId, new AtomicInteger());
+    }
+
+    @VisibleForTesting
+    public DefaultClientChannelManager(
+            OriginName originName, IClientConfig clientConfig,
+            Resolver<? extends DiscoveryResult> resolver, Registry spectatorRegistry) {
+        this.originName = Objects.requireNonNull(originName, "originName");
+        this.dynamicServerResolver = resolver;
+
+        String metricId = originName.getMetricId();
+
+        this.clientConfig = clientConfig;
+        this.spectatorRegistry = spectatorRegistry;
+        this.perServerPools = new ConcurrentHashMap<>(200);
 
         this.connPoolConfig = new ConnectionPoolConfigImpl(originName, this.clientConfig);
 
-        this.createNewConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_create", originName);
-        this.createConnSucceededCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_create_success", originName);
-        this.createConnFailedCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_create_fail", originName);
+        this.createNewConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_create", metricId);
+        this.createConnSucceededCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_create_success", metricId);
+        this.createConnFailedCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_create_fail", metricId);
 
-        this.closeConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_close", originName);
-        this.requestConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_request", originName);
-        this.reuseConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_reuse", originName);
-        this.releaseConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_release", originName);
-        this.alreadyClosedCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_alreadyClosed", originName);
-        this.connTakenFromPoolIsNotOpen = SpectatorUtils.newCounter(METRIC_PREFIX + "_fromPoolIsClosed", originName);
-        this.maxConnsPerHostExceededCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_maxConnsPerHostExceeded", originName);
-        this.closeWrtBusyConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_closeWrtBusyConnCounter", originName);
-        this.connEstablishTimer = PercentileTimer.get(spectatorRegistry, spectatorRegistry.createId(METRIC_PREFIX + "_createTiming", "id", originName));
-        this.connsInPool = SpectatorUtils.newGauge(METRIC_PREFIX + "_inPool", originName, new AtomicInteger());
-        this.connsInUse = SpectatorUtils.newGauge(METRIC_PREFIX + "_inUse", originName, new AtomicInteger());
+        this.closeConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_close", metricId);
+        this.requestConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_request", metricId);
+        this.reuseConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_reuse", metricId);
+        this.releaseConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_release", metricId);
+        this.alreadyClosedCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_alreadyClosed", metricId);
+        this.connTakenFromPoolIsNotOpen = SpectatorUtils.newCounter(METRIC_PREFIX + "_fromPoolIsClosed", metricId);
+        this.maxConnsPerHostExceededCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_maxConnsPerHostExceeded", metricId);
+        this.closeWrtBusyConnCounter = SpectatorUtils.newCounter(METRIC_PREFIX + "_closeWrtBusyConnCounter", metricId);
+        this.connEstablishTimer = PercentileTimer.get(spectatorRegistry, spectatorRegistry.createId(METRIC_PREFIX + "_createTiming", "id", metricId));
+        this.connsInPool = SpectatorUtils.newGauge(METRIC_PREFIX + "_inPool", metricId, new AtomicInteger());
+        this.connsInUse = SpectatorUtils.newGauge(METRIC_PREFIX + "_inUse", metricId, new AtomicInteger());
     }
 
     @Override
@@ -141,47 +176,6 @@ public class DefaultClientChannelManager implements ClientChannelManager {
         return new NettyClientConnectionFactory(connPoolConfig, clientConnInitializer);
     }
 
-    protected DynamicServerListLoadBalancer createLoadBalancer(IClientConfig clientConfig) {
-        // Create and configure a loadbalancer for this vip.
-        String defaultLoadBalancerClassName = getLoadBalancerClass().getName();
-        String loadBalancerClassName = clientConfig.get(NFLoadBalancerClassName, defaultLoadBalancerClassName);
-
-        DynamicServerListLoadBalancer lb;
-        try {
-            Class clazz = Class.forName(loadBalancerClassName);
-            lb = (DynamicServerListLoadBalancer) clazz.newInstance();
-            lb.initWithNiwsConfig(clientConfig);
-        }
-        catch (Exception e) {
-            throw new IllegalStateException("Could not instantiate requested class for LoadBalancer! " +
-                    "loadBalancerClassNam=" + String.valueOf(loadBalancerClassName), e);
-        }
-
-        return lb;
-    }
-
-    protected Class<? extends DynamicServerListLoadBalancer> getLoadBalancerClass() {
-        return ZoneAwareLoadBalancer.class;
-    }
-
-    protected void removeMissingServerConnectionPools(List<Server> oldList, List<Server> newList) {
-        Set<Server> oldSet = new HashSet<>(oldList);
-        Set<Server> newSet = new HashSet<>(newList);
-        Set<Server> removedSet = Sets.difference(oldSet, newSet);
-
-        if (!removedSet.isEmpty()) {
-            LOG.debug("Removing connection pools for missing servers. vip = " + this.vip
-                    + ". " + removedSet.size() + " servers gone.");
-
-            for (Server s : removedSet) {
-                IConnectionPool pool = perServerPools.remove(s);
-                if (pool != null) {
-                    pool.shutdown();
-                }
-            }
-        }
-    }
-
     @Override
     public ConnectionPoolConfig getConfig() {
         return connPoolConfig;
@@ -189,7 +183,7 @@ public class DefaultClientChannelManager implements ClientChannelManager {
 
     @Override
     public boolean isAvailable() {
-        return !loadBalancer.getReachableServers().isEmpty();
+        return dynamicServerResolver.hasServers();
     }
 
     @Override
@@ -206,7 +200,7 @@ public class DefaultClientChannelManager implements ClientChannelManager {
     public void shutdown() {
         this.shuttingDown = true;
 
-        loadBalancer.shutdown();
+        dynamicServerResolver.shutdown();
 
         for (IConnectionPool pool : perServerPools.values()) {
             pool.shutdown();
@@ -220,9 +214,9 @@ public class DefaultClientChannelManager implements ClientChannelManager {
         releaseConnCounter.increment();
         connsInUse.decrementAndGet();
 
-        final ServerStats stats = conn.getServerStats();
-        stats.decrementActiveRequestsCount();
-        stats.incrementNumRequests();
+        final DiscoveryResult discoveryResult = conn.getServer();
+        discoveryResult.decrementActiveRequestsCount();
+        discoveryResult.incrementNumRequests();
 
         if (shuttingDown) {
             return false;
@@ -238,7 +232,7 @@ public class DefaultClientChannelManager implements ClientChannelManager {
             conn.setInPool(false);
             conn.close();
         }
-        else if (stats.isCircuitBreakerTripped()) {
+        else if (discoveryResult.isCircuitBreakerTripped()) {
             // Don't put conns for currently circuit-tripped servers back into the pool.
             conn.setInPool(false);
             conn.close();
@@ -254,7 +248,7 @@ public class DefaultClientChannelManager implements ClientChannelManager {
             releaseHandlers(conn);
 
             // Attempt to return connection to the pool.
-            IConnectionPool pool = perServerPools.get(conn.getServer());
+            IConnectionPool pool = perServerPools.get(discoveryResult);
             if (pool != null) {
                 released = pool.release(conn);
             }
@@ -313,20 +307,16 @@ public class DefaultClientChannelManager implements ClientChannelManager {
 
     @Override
     public Promise<PooledConnection> acquire(final EventLoop eventLoop) {
-        return acquire(eventLoop, null, null, null, 1, CurrentPassport.create(),
-                new AtomicReference<>(), new AtomicReference<>());
+        return acquire(eventLoop, null, CurrentPassport.create(), new AtomicReference<>(), new AtomicReference<>());
     }
 
     @Override
-    public Promise<PooledConnection> acquire(final EventLoop eventLoop, final Object key, final String httpMethod,
-                                             final String uri, final int attemptNum, final CurrentPassport passport,
-                                             final AtomicReference<Server> selectedServer,
-                                             final AtomicReference<String> selectedHostAdddr)
-    {
-
-        if (attemptNum < 1) {
-            throw new IllegalArgumentException("attemptNum must be greater than zero");
-        }
+    public Promise<PooledConnection> acquire(
+            EventLoop eventLoop,
+            @Nullable Object key,
+            CurrentPassport passport,
+            AtomicReference<DiscoveryResult> selectedServer,
+            AtomicReference<? super InetAddress> selectedHostAddr) {
 
         if (shuttingDown) {
             Promise<PooledConnection> promise = eventLoop.newPromise();
@@ -335,58 +325,50 @@ public class DefaultClientChannelManager implements ClientChannelManager {
         }
 
         // Choose the next load-balanced server.
-        final Server chosenServer = loadBalancer.chooseServer(key);
-        if (chosenServer == null) {
+        final DiscoveryResult chosenServer = dynamicServerResolver.resolve(key);
+
+        //(argha-c): Always ensure the selected server is updated, since the call chain relies on this mutation.
+        selectedServer.set(chosenServer);
+        if (chosenServer == DiscoveryResult.EMPTY) {
             Promise<PooledConnection> promise = eventLoop.newPromise();
             promise.setFailure(new OriginConnectException("No servers available", OutboundErrorType.NO_AVAILABLE_SERVERS));
             return promise;
         }
 
-        final InstanceInfo instanceInfo = chosenServer instanceof DiscoveryEnabledServer ?
-                ((DiscoveryEnabledServer) chosenServer).getInstanceInfo() :
-                // create mock instance info for non-discovery instances
-                new InstanceInfo(chosenServer.getId(), null, null, chosenServer.getHost(), chosenServer.getId(),
-                        null, null, null, null, null, null, null, null, 0, null, null, null, null, null, null, null, null, null, null, null, null);
 
-
-        selectedServer.set(chosenServer);
 
         // Now get the connection-pool for this server.
         IConnectionPool pool = perServerPools.computeIfAbsent(chosenServer, s -> {
-            // Get the stats from LB for this server.
-            LoadBalancerStats lbStats = loadBalancer.getLoadBalancerStats();
-            ServerStats stats = lbStats.getSingleServerStat(chosenServer);
-
+            SocketAddress finalServerAddr = pickAddress(chosenServer);
             final ClientChannelManager clientChannelMgr = this;
-            PooledConnectionFactory pcf = createPooledConnectionFactory(chosenServer, instanceInfo, stats, clientChannelMgr, closeConnCounter, closeWrtBusyConnCounter);
+            PooledConnectionFactory pcf = createPooledConnectionFactory(chosenServer, clientChannelMgr, closeConnCounter, closeWrtBusyConnCounter);
 
             // Create a new pool for this server.
-            return createConnectionPool(chosenServer, stats, instanceInfo, clientConnFactory, pcf, connPoolConfig,
+            return createConnectionPool(chosenServer, finalServerAddr, clientConnFactory, pcf, connPoolConfig,
                     clientConfig, createNewConnCounter, createConnSucceededCounter, createConnFailedCounter,
                     requestConnCounter, reuseConnCounter, connTakenFromPoolIsNotOpen, maxConnsPerHostExceededCounter,
                     connEstablishTimer, connsInPool, connsInUse);
         });
 
-        return pool.acquire(eventLoop, null, httpMethod, uri, attemptNum, passport, selectedHostAdddr);
+        return pool.acquire(eventLoop, passport, selectedHostAddr);
     }
 
-    protected PooledConnectionFactory createPooledConnectionFactory(Server chosenServer, InstanceInfo instanceInfo, ServerStats stats, ClientChannelManager clientChannelMgr,
-                                                                    Counter closeConnCounter, Counter closeWrtBusyConnCounter) {
-        return ch -> new PooledConnection(ch, chosenServer, clientChannelMgr, instanceInfo, stats, closeConnCounter, closeWrtBusyConnCounter);
+    protected PooledConnectionFactory createPooledConnectionFactory(
+            DiscoveryResult chosenServer, ClientChannelManager clientChannelMgr, Counter closeConnCounter,
+            Counter closeWrtBusyConnCounter) {
+        return ch -> new PooledConnection(ch, chosenServer, clientChannelMgr, closeConnCounter, closeWrtBusyConnCounter);
     }
 
-    protected IConnectionPool createConnectionPool(Server chosenServer, ServerStats stats, InstanceInfo instanceInfo,
-                                                   NettyClientConnectionFactory clientConnFactory, PooledConnectionFactory pcf,
-                                                   ConnectionPoolConfig connPoolConfig, IClientConfig clientConfig,
-                                                   Counter createNewConnCounter, Counter createConnSucceededCounter,
-                                                   Counter createConnFailedCounter, Counter requestConnCounter,
-                                                   Counter reuseConnCounter, Counter connTakenFromPoolIsNotOpen,
-                                                   Counter maxConnsPerHostExceededCounter, PercentileTimer connEstablishTimer,
-                                                   AtomicInteger connsInPool, AtomicInteger connsInUse) {
+    protected IConnectionPool createConnectionPool(
+            DiscoveryResult discoveryResult, SocketAddress serverAddr,
+            NettyClientConnectionFactory clientConnFactory, PooledConnectionFactory pcf,
+            ConnectionPoolConfig connPoolConfig, IClientConfig clientConfig, Counter createNewConnCounter,
+            Counter createConnSucceededCounter, Counter createConnFailedCounter, Counter requestConnCounter,
+            Counter reuseConnCounter, Counter connTakenFromPoolIsNotOpen, Counter maxConnsPerHostExceededCounter,
+            PercentileTimer connEstablishTimer, AtomicInteger connsInPool, AtomicInteger connsInUse) {
         return new PerServerConnectionPool(
-                chosenServer,
-                stats,
-                instanceInfo,
+                discoveryResult,
+                serverAddr,
                 clientConnFactory,
                 pcf,
                 connPoolConfig,
@@ -404,6 +386,24 @@ public class DefaultClientChannelManager implements ClientChannelManager {
         );
     }
 
+    final class ServerPoolListener implements ResolverListener<DiscoveryResult> {
+
+        @Override
+        public void onChange(List<DiscoveryResult> removedSet) {
+            if (!removedSet.isEmpty()) {
+                LOG.debug("Removing connection pools for missing servers. name = {}. {} servers gone.", originName,
+                        removedSet.size());
+                for (DiscoveryResult s : removedSet) {
+                    IConnectionPool pool = perServerPools.remove(s);
+                    if (pool != null) {
+                        pool.shutdown();
+                    }
+                }
+            }
+        }
+
+    }
+
     @Override
     public int getConnsInPool() {
         return connsInPool.get();
@@ -414,16 +414,41 @@ public class DefaultClientChannelManager implements ClientChannelManager {
         return connsInUse.get();
     }
 
-    // This is just used for information in the RestClient 'bridge'.
-    public DynamicServerListLoadBalancer getLoadBalancer() {
-        return this.loadBalancer;
-    }
-
-    public IClientConfig getClientConfig() {
-        return this.loadBalancer.getClientConfig();
-    }
-
-    protected ConcurrentHashMap<Server, IConnectionPool> getPerServerPools() {
+    protected ConcurrentHashMap<DiscoveryResult, IConnectionPool> getPerServerPools() {
         return perServerPools;
+    }
+
+    @VisibleForTesting
+    static SocketAddress pickAddressInternal(ResolverResult chosenServer, @Nullable OriginName originName) {
+        String rawHost;
+        int port;
+            rawHost = chosenServer.getHost();
+            port = chosenServer.getPort();
+        InetSocketAddress serverAddr;
+        try {
+            InetAddress ipAddr = InetAddresses.forString(rawHost);
+            serverAddr = new InetSocketAddress(ipAddr, port);
+        } catch (IllegalArgumentException e1) {
+            LOG.warn("NettyClientConnectionFactory got an unresolved address, addr: {}", rawHost);
+            Counter unresolvedDiscoveryHost = SpectatorUtils.newCounter(
+                    "unresolvedDiscoveryHost",
+                    originName == null ? "unknownOrigin" : originName.getTarget());
+            unresolvedDiscoveryHost.increment();
+            try {
+                serverAddr = new InetSocketAddress(rawHost, port);
+            } catch (RuntimeException e2) {
+                e1.addSuppressed(e2);
+                throw e1;
+            }
+        }
+
+        return serverAddr;
+    }
+
+    /**
+     * Given a server chosen from the load balancer, pick the appropriate address to connect to.
+     */
+    protected SocketAddress pickAddress(DiscoveryResult chosenServer) {
+        return pickAddressInternal(chosenServer, connPoolConfig.getOriginName());
     }
 }

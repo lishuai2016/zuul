@@ -34,9 +34,13 @@ import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.ssl.SslHandshakeCompletionEvent;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.ReadTimeoutException;
+import io.netty.util.AttributeKey;
 import io.netty.util.ReferenceCountUtil;
+import io.perfmark.PerfMark;
+import io.perfmark.TaskCloseable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,6 +60,7 @@ public class OriginResponseReceiver extends ChannelDuplexHandler {
     private volatile ProxyEndpoint edgeProxy;
 
     private static final Logger LOG = LoggerFactory.getLogger(OriginResponseReceiver.class);
+    private static final AttributeKey<Throwable> SSL_HANDSHAKE_UNSUCCESS_FROM_ORIGIN_THROWABLE = AttributeKey.newInstance("_ssl_handshake_from_origin_throwable");
     public static final String CHANNEL_HANDLER_NAME = "_origin_response_receiver";
 
     public OriginResponseReceiver(final ProxyEndpoint edgeProxy) {
@@ -66,8 +71,15 @@ public class OriginResponseReceiver extends ChannelDuplexHandler {
         edgeProxy = null;
     }
 
+
     @Override
-    public void channelRead(final ChannelHandlerContext ctx, Object msg) throws Exception {
+    public final void channelRead(final ChannelHandlerContext ctx, Object msg) throws Exception {
+        try (TaskCloseable a = PerfMark.traceTask("ORR.channelRead")) {
+            channelReadInternal(ctx, msg);
+        }
+    }
+
+    private void channelReadInternal(final ChannelHandlerContext ctx, Object msg) throws Exception {
         if (msg instanceof HttpResponse) {
             if (edgeProxy != null) {
                 edgeProxy.responseFromOrigin((HttpResponse) msg);
@@ -114,6 +126,10 @@ public class OriginResponseReceiver extends ChannelDuplexHandler {
             finally {
                 postCompleteHook(ctx, evt);
             }
+        }
+        else if (evt instanceof SslHandshakeCompletionEvent && !((SslHandshakeCompletionEvent) evt).isSuccess()) {
+            Throwable cause = ((SslHandshakeCompletionEvent) evt).cause();
+            ctx.channel().attr(SSL_HANDSHAKE_UNSUCCESS_FROM_ORIGIN_THROWABLE).set(cause);
         }
         else if (evt instanceof IdleStateEvent) {
             if (edgeProxy != null) {
@@ -173,7 +189,13 @@ public class OriginResponseReceiver extends ChannelDuplexHandler {
     }
 
     @Override
-    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+    public final void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        try (TaskCloseable ignore = PerfMark.traceTask("ORR.writeInternal")) {
+            writeInternal(ctx, msg, promise);
+        }
+    }
+
+    private void writeInternal(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
         if (!ctx.channel().isActive()) {
             ReferenceCountUtil.release(msg);
             return;
@@ -182,7 +204,15 @@ public class OriginResponseReceiver extends ChannelDuplexHandler {
         if (msg instanceof HttpRequestMessage) {
             promise.addListener((future) -> {
                 if (!future.isSuccess()) {
-                    fireWriteError("request headers", future.cause(), ctx);
+                    Throwable cause = ctx.channel().attr(SSL_HANDSHAKE_UNSUCCESS_FROM_ORIGIN_THROWABLE).get();
+                    if (cause != null) {
+                        // Set the specific SSL handshake error if the handlers have already caught them
+                        ctx.channel().attr(SSL_HANDSHAKE_UNSUCCESS_FROM_ORIGIN_THROWABLE).set(null);
+                        fireWriteError("request headers", cause, ctx);
+                        LOG.debug("SSLException is overridden by SSLHandshakeException caught in handler level. Original SSL exception message: ", future.cause());
+                    } else {
+                        fireWriteError("request headers", future.cause(), ctx);
+                    }
                 }
             });
 

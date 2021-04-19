@@ -16,30 +16,28 @@
 
 package com.netflix.zuul.netty.connectionpool;
 
-import com.google.common.base.Strings;
-import com.netflix.appinfo.InstanceInfo;
 import com.netflix.client.config.IClientConfig;
-import com.netflix.loadbalancer.Server;
-import com.netflix.loadbalancer.ServerStats;
-import com.netflix.niws.loadbalancer.DiscoveryEnabledServer;
 import com.netflix.spectator.api.Counter;
 import com.netflix.spectator.api.Timer;
+import com.netflix.zuul.discovery.DiscoveryResult;
 import com.netflix.zuul.exception.OutboundErrorType;
 import com.netflix.zuul.passport.CurrentPassport;
 import com.netflix.zuul.passport.PassportState;
-import com.netflix.zuul.stats.Timing;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.EventLoop;
 import io.netty.util.concurrent.Promise;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.Deque;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.annotation.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * User: michaels@netflix.com
@@ -48,16 +46,17 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class PerServerConnectionPool implements IConnectionPool
 {
-    private ConcurrentHashMap<EventLoop, Deque<PooledConnection>> connectionsPerEventLoop = new ConcurrentHashMap<>();
+    private static final Logger LOG = LoggerFactory.getLogger(PerServerConnectionPool.class);
 
-    private final Server server;
-    private final ServerStats stats;
-    private final InstanceInfo instanceInfo;
+    private final ConcurrentHashMap<EventLoop, Deque<PooledConnection>> connectionsPerEventLoop =
+            new ConcurrentHashMap<>();
+
+    private final DiscoveryResult server;
+    private final SocketAddress serverAddr;
     private final NettyClientConnectionFactory connectionFactory;
     private final PooledConnectionFactory pooledConnectionFactory;
     private final ConnectionPoolConfig config;
     private final IClientConfig niwsClientConfig;
-
 
     private final Counter createNewConnCounter;
     private final Counter createConnSucceededCounter;
@@ -77,26 +76,25 @@ public class PerServerConnectionPool implements IConnectionPool
      */
     private final AtomicInteger connCreationsInProgress;
 
-    private static final Logger LOG = LoggerFactory.getLogger(PerServerConnectionPool.class);
-
-
-    public PerServerConnectionPool(Server server, ServerStats stats, InstanceInfo instanceInfo,
-                                   NettyClientConnectionFactory connectionFactory,
-                                   PooledConnectionFactory pooledConnectionFactory,
-                                   ConnectionPoolConfig config,
-                                   IClientConfig niwsClientConfig,
-                                   Counter createNewConnCounter, 
-                                   Counter createConnSucceededCounter, 
-                                   Counter createConnFailedCounter,
-                                   Counter requestConnCounter, Counter reuseConnCounter, 
-                                   Counter connTakenFromPoolIsNotOpen,
-                                   Counter maxConnsPerHostExceededCounter,
-                                   Timer connEstablishTimer,
-                                   AtomicInteger connsInPool, AtomicInteger connsInUse)
-    {
+    public PerServerConnectionPool(
+            DiscoveryResult server,
+            SocketAddress serverAddr,
+            NettyClientConnectionFactory connectionFactory,
+            PooledConnectionFactory pooledConnectionFactory,
+            ConnectionPoolConfig config,
+            IClientConfig niwsClientConfig,
+            Counter createNewConnCounter,
+            Counter createConnSucceededCounter,
+            Counter createConnFailedCounter,
+            Counter requestConnCounter, Counter reuseConnCounter,
+            Counter connTakenFromPoolIsNotOpen,
+            Counter maxConnsPerHostExceededCounter,
+            Timer connEstablishTimer,
+            AtomicInteger connsInPool,
+            AtomicInteger connsInUse) {
         this.server = server;
-        this.stats = stats;
-        this.instanceInfo = instanceInfo;
+        // Note: child classes can sometimes connect to different addresses than
+        this.serverAddr = Objects.requireNonNull(serverAddr, "serverAddr");
         this.connectionFactory = connectionFactory;
         this.pooledConnectionFactory = pooledConnectionFactory;
         this.config = config;
@@ -126,21 +124,14 @@ public class PerServerConnectionPool implements IConnectionPool
         return niwsClientConfig;
     }
 
-    public Server getServer()
-    {
-        return server;
-    }
-
     @Override
     public boolean isAvailable()
     {
         return true;
     }
 
-
     /** function to run when a connection is acquired before returning it to caller. */
-    private void onAcquire(final PooledConnection conn, String httpMethod, String uriStr, 
-                           int attemptNum, CurrentPassport passport)
+    private void onAcquire(final PooledConnection conn, CurrentPassport passport)
     {
         passport.setOnChannel(conn.getChannel());
         removeIdleStateHandler(conn);
@@ -154,12 +145,10 @@ public class PerServerConnectionPool implements IConnectionPool
     }
 
     @Override
-    public Promise<PooledConnection> acquire(EventLoop eventLoop, Object key, String httpMethod, String uri,
-                                             int attemptNum, CurrentPassport passport,
-                                             AtomicReference<String> selectedHostAddr)
-    {
+    public Promise<PooledConnection> acquire(
+            EventLoop eventLoop, CurrentPassport passport, AtomicReference<? super InetAddress> selectedHostAddr) {
         requestConnCounter.increment();
-        stats.incrementActiveRequestsCount();
+        server.incrementActiveRequestsCount();
         
         Promise<PooledConnection> promise = eventLoop.newPromise();
 
@@ -170,13 +159,13 @@ public class PerServerConnectionPool implements IConnectionPool
             conn.startRequestTimer();
             conn.incrementUsageCount();
             conn.getChannel().read();
-            onAcquire(conn, httpMethod, uri, attemptNum, passport);
+            onAcquire(conn, passport);
             initPooledConnection(conn, promise);
-            selectedHostAddr.set(getHostFromServer(conn.getServer()));
+            selectedHostAddr.set(getSelectedHostString(serverAddr));
         }
         else {
             // connection pool empty, create new connection using client connection factory.
-            tryMakingNewConnection(eventLoop, promise, httpMethod, uri, attemptNum, passport, selectedHostAddr);
+            tryMakingNewConnection(eventLoop, promise, passport, selectedHostAddr);
         }
 
         return promise;
@@ -228,13 +217,12 @@ public class PerServerConnectionPool implements IConnectionPool
         return pool;
     }
 
-    protected void tryMakingNewConnection(final EventLoop eventLoop, final Promise<PooledConnection> promise,
-                                        final String httpMethod, final String uri, final int attemptNum,
-                                        final CurrentPassport passport, final AtomicReference<String> selectedHostAddr)
-    {
+    protected void tryMakingNewConnection(
+            EventLoop eventLoop, Promise<PooledConnection> promise, CurrentPassport passport,
+            AtomicReference<? super InetAddress> selectedHostAddr) {
         // Enforce MaxConnectionsPerHost config.
         int maxConnectionsPerHost = config.maxConnectionsPerHost();
-        int openAndOpeningConnectionCount = stats.getOpenConnectionsCount() + connCreationsInProgress.get(); 
+        int openAndOpeningConnectionCount = server.getOpenConnectionsCount() + connCreationsInProgress.get();
         if (maxConnectionsPerHost != -1 && openAndOpeningConnectionCount >= maxConnectionsPerHost) {
             maxConnsPerHostExceededCounter.increment();
             promise.setFailure(new OriginConnectException(
@@ -243,33 +231,28 @@ public class PerServerConnectionPool implements IConnectionPool
             LOG.warn("Unable to create new connection because at MaxConnectionsPerHost! "
                             + "maxConnectionsPerHost=" + maxConnectionsPerHost
                             + ", connectionsPerHost=" + openAndOpeningConnectionCount
-                            + ", host=" + instanceInfo.getId()
+                            + ", host=" + server.getServerId()
                             + "origin=" + config.getOriginName()
                     );
             return;
         }
 
-        Timing timing = startConnEstablishTimer();
         try {
             createNewConnCounter.increment();
             connCreationsInProgress.incrementAndGet();
             passport.add(PassportState.ORIGIN_CH_CONNECTING);
-            
-            // Choose to use either IP or hostname.
-            String host = getHostFromServer(server);
-            selectedHostAddr.set(host);
-            
-            final ChannelFuture cf = connectToServer(eventLoop, passport, host);
+
+            selectedHostAddr.set(getSelectedHostString(serverAddr));
+
+            final ChannelFuture cf = connectToServer(eventLoop, passport, serverAddr);
 
             if (cf.isDone()) {
-                endConnEstablishTimer(timing);
-                handleConnectCompletion(cf, promise, httpMethod, uri, attemptNum, passport);
+                handleConnectCompletion(cf, promise, passport);
             }
             else {
                 cf.addListener(future -> {
                     try {
-                        endConnEstablishTimer(timing);
-                        handleConnectCompletion((ChannelFuture) future, promise, httpMethod, uri, attemptNum, passport);
+                        handleConnectCompletion((ChannelFuture) future, promise, passport);
                     }
                     catch (Throwable e) {
                         if (! promise.isDone()) {
@@ -277,89 +260,52 @@ public class PerServerConnectionPool implements IConnectionPool
                         }
                         LOG.warn("Error creating new connection! "
                                         + "origin=" + config.getOriginName()
-                                        + ", host=" + instanceInfo.getId()
+                                        + ", host=" + server.getServerId()
                                 );
                     }
                 });
             }
         }
         catch (Throwable e) {
-            endConnEstablishTimer(timing);
             promise.setFailure(e);
         }
     }
 
-    protected ChannelFuture connectToServer(EventLoop eventLoop, CurrentPassport passport, String host) {
-        return connectionFactory.connect(eventLoop, host, server.getPort(), passport);
+    protected ChannelFuture connectToServer(EventLoop eventLoop, CurrentPassport passport, SocketAddress serverAddr) {
+        return connectionFactory.connect(eventLoop, serverAddr, passport);
     }
 
-    private Timing startConnEstablishTimer()
-    {
-        Timing timing = new Timing("connection_establish");
-        timing.start();
-        return timing;
-    }
-
-    private void endConnEstablishTimer(Timing timing)
-    {
-        timing.end();
-        connEstablishTimer.record(timing.getDuration(), TimeUnit.NANOSECONDS);
-    }
-
-    protected String getHostFromServer(Server server)
-    {
-        String host = server.getHost();
-        if (! config.useIPAddrForServer()) {
-            return host;
-        }
-        if (server instanceof DiscoveryEnabledServer) {
-            DiscoveryEnabledServer discoveryServer = (DiscoveryEnabledServer) server;
-            if (discoveryServer.getInstanceInfo() != null) {
-                String ip = discoveryServer.getInstanceInfo().getIPAddr();
-                if (! Strings.isNullOrEmpty(ip)) {
-                    host = ip;
-                }
-            }
-        }
-        return host;
-    }
-
-    protected void handleConnectCompletion(final ChannelFuture cf,
-                                           final Promise<PooledConnection> callerPromise,
-                                           final String httpMethod,
-                                           final String uri,
-                                           final int attemptNum,
-                                           final CurrentPassport passport)
-    {
+    protected void handleConnectCompletion(
+            ChannelFuture cf, Promise<PooledConnection> callerPromise, CurrentPassport passport) {
         connCreationsInProgress.decrementAndGet();
         
         if (cf.isSuccess()) {
             
             passport.add(PassportState.ORIGIN_CH_CONNECTED);
             
-            stats.incrementOpenConnectionsCount();
+            server.incrementOpenConnectionsCount();
             createConnSucceededCounter.increment();
             connsInUse.incrementAndGet();
 
-            createConnection(cf, callerPromise, httpMethod, uri, attemptNum, passport);
+            createConnection(cf, callerPromise, passport);
         }
         else {
-            stats.incrementSuccessiveConnectionFailureCount();
-            stats.addToFailureCount();
-            stats.decrementActiveRequestsCount();
+            server.incrementSuccessiveConnectionFailureCount();
+            server.addToFailureCount();
+            server.decrementActiveRequestsCount();
             createConnFailedCounter.increment();
             callerPromise.setFailure(new OriginConnectException(cf.cause().getMessage(), OutboundErrorType.CONNECT_ERROR));
         }
     }
 
-    protected void createConnection(ChannelFuture cf, Promise<PooledConnection> callerPromise, String httpMethod, String uri,
-                                    int attemptNum, CurrentPassport passport) {
+    protected void createConnection(
+            ChannelFuture cf, Promise<PooledConnection> callerPromise, CurrentPassport passport) {
         final PooledConnection conn = pooledConnectionFactory.create(cf.channel());
 
         conn.incrementUsageCount();
         conn.startRequestTimer();
         conn.getChannel().read();
-        onAcquire(conn, httpMethod, uri, attemptNum, passport);
+        onAcquire(conn, passport);
         callerPromise.setSuccess(conn);
     }
 
@@ -444,6 +390,16 @@ public class PerServerConnectionPool implements IConnectionPool
     @Override
     public int getConnsInUse() {
         return connsInUse.get();
+    }
+
+    @Nullable
+    private static InetAddress getSelectedHostString(SocketAddress addr) {
+        if (addr instanceof InetSocketAddress) {
+            return ((InetSocketAddress) addr).getAddress();
+        } else {
+            // If it's some other kind of address, just set it to empty
+            return null;
+        }
     }
 
 }

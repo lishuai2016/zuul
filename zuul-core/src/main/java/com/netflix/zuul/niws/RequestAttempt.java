@@ -19,15 +19,18 @@ package com.netflix.zuul.niws;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.common.base.Throwables;
 import com.netflix.appinfo.AmazonInfo;
 import com.netflix.appinfo.InstanceInfo;
 import com.netflix.client.config.IClientConfig;
 import com.netflix.client.config.IClientConfigKey;
-import com.netflix.loadbalancer.Server;
-import com.netflix.niws.loadbalancer.DiscoveryEnabledServer;
+import com.netflix.zuul.discovery.DiscoveryResult;
 import com.netflix.zuul.exception.OutboundException;
+import com.netflix.zuul.discovery.SimpleMetaInfo;
 import com.netflix.zuul.netty.connectionpool.OriginConnectException;
 import io.netty.handler.timeout.ReadTimeoutException;
+
+import javax.net.ssl.SSLHandshakeException;
 
 /**
  * User: michaels@netflix.com
@@ -41,6 +44,7 @@ public class RequestAttempt
     private int attempt;
     private int status;
     private long duration;
+    private String cause;
     private String error;
     private String exceptionType;
     private String app;
@@ -51,7 +55,7 @@ public class RequestAttempt
     private String vip;
     private String region;
     private String availabilityZone;
-    private int readTimeout;
+    private long readTimeout;
     private int connectTimeout;
     private int maxRetries;
 
@@ -95,36 +99,28 @@ public class RequestAttempt
         this.maxRetries = maxRetries;
     }
 
-    public RequestAttempt(final Server server, final IClientConfig clientConfig, int attemptNumber, int readTimeout) {
+    public RequestAttempt(final DiscoveryResult server, final IClientConfig clientConfig, int attemptNumber, int readTimeout) {
         this.status = -1;
         this.attempt = attemptNumber;
         this.readTimeout = readTimeout;
 
-        if (server != null) {
+        if (server != null && server != DiscoveryResult.EMPTY) {
             this.host = server.getHost();
             this.port = server.getPort();
             this.availabilityZone = server.getZone();
 
-            if (server instanceof DiscoveryEnabledServer) {
-                InstanceInfo instanceInfo = ((DiscoveryEnabledServer) server).getInstanceInfo();
-                this.app = instanceInfo.getAppName().toLowerCase();
-                this.asg = instanceInfo.getASGName();
-                this.instanceId = instanceInfo.getInstanceId();
-                this.host = instanceInfo.getHostName();
-                this.port = instanceInfo.getPort();
+            if (server.isDiscoveryEnabled()) {
+                this.app = server.getAppName().toLowerCase();
+                this.asg = server.getASGName();
+                this.instanceId = server.getServerId();
+                this.host = server.getHost();
+                this.port = server.getPort();
+                this.vip = server.getTarget();
+                this.availabilityZone = server.getAvailabilityZone();
 
-                if (server.getPort() == instanceInfo.getSecurePort()) {
-                    this.vip = instanceInfo.getSecureVipAddress();
-                }
-                else {
-                    this.vip = instanceInfo.getVIPAddress();
-                }
-                if (instanceInfo.getDataCenterInfo() instanceof AmazonInfo) {
-                    this.availabilityZone = ((AmazonInfo) instanceInfo.getDataCenterInfo()).getMetadata().get("availability-zone");
-                }
             }
             else {
-                final Server.MetaInfo metaInfo = server.getMetaInfo();
+                SimpleMetaInfo metaInfo = server.getMetaInfo();
                 if (metaInfo != null) {
                     this.asg = metaInfo.getServerGroup();
                     this.vip = metaInfo.getServiceIdForDiscovery();
@@ -213,7 +209,7 @@ public class RequestAttempt
         return exceptionType;
     }
 
-    public int getReadTimeout()
+    public long getReadTimeout()
     {
         return readTimeout;
     }
@@ -283,7 +279,7 @@ public class RequestAttempt
         this.availabilityZone = availabilityZone;
     }
 
-    public void setReadTimeout(int readTimeout)
+    public void setReadTimeout(long readTimeout)
     {
         this.readTimeout = readTimeout;
     }
@@ -321,9 +317,15 @@ public class RequestAttempt
                 error = obe.getOutboundErrorType().toString();
                 exceptionType = OutboundException.class.getSimpleName();
             }
+            else if (t instanceof SSLHandshakeException) {
+                error = t.getMessage();
+                exceptionType = t.getClass().getSimpleName();
+                cause = t.getCause().getMessage();
+            }
             else {
                 error = t.getMessage();
                 exceptionType = t.getClass().getSimpleName();
+                cause = Throwables.getStackTraceAsString(t);
             }
         }
     }
@@ -352,6 +354,7 @@ public class RequestAttempt
         root.put("attempt", attempt);
 
         putNullableAttribute(root, "error", error);
+        putNullableAttribute(root, "cause", cause);
         putNullableAttribute(root, "exceptionType", exceptionType);
         putNullableAttribute(root, "region", region);
         putNullableAttribute(root, "asg", asg);

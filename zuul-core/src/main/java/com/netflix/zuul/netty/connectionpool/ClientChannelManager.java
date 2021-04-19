@@ -17,11 +17,12 @@
 package com.netflix.zuul.netty.connectionpool;
 
 
-import com.netflix.loadbalancer.Server;
+import com.netflix.zuul.discovery.DiscoveryResult;
 import com.netflix.zuul.passport.CurrentPassport;
 import io.netty.channel.EventLoop;
 import io.netty.util.concurrent.Promise;
 
+import java.net.InetAddress;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -43,9 +44,12 @@ public interface ClientChannelManager
 
     Promise<PooledConnection> acquire(EventLoop eventLoop);
 
-    Promise<PooledConnection> acquire(EventLoop eventLoop, Object key, String httpMethod, String uri, int retryNum,
-                                      CurrentPassport passport, AtomicReference<Server> selectedServer,
-                                      AtomicReference<String> selectedHostAddr);
+    Promise<PooledConnection> acquire(
+            EventLoop eventLoop,
+            Object key,
+            CurrentPassport passport,
+            AtomicReference<DiscoveryResult> selectedServer,
+            AtomicReference<? super InetAddress> selectedHostAddr);
 
     boolean isCold();
 
